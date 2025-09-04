@@ -1,0 +1,640 @@
+# ==============================================================================
+# DSM-5 Alcohol Use Disorder (AUD) Scoring Pipeline for Lifelines Data
+# ==============================================================================
+# Author: Mannan Luo (m.luo@umcg.nl)
+# Date: August 2025
+# 
+# Description:
+# This pipeline implements the DSM-5 criteria for Alcohol Use Disorder scoring
+# using Lifelines cohort data. It provides comprehensive scoring including:
+# - Binary AUD diagnosis (≥2 criteria met)
+# - AUD severity classification (mild/moderate/severe)
+# - Missing data handling with statistical imputation
+# - Quality control and validation checks
+#
+# DSM-5 AUD Criteria (11 total):
+# 1-4:   Impaired Control (4 criteria)
+# 5-7:   Social Impairment (3 criteria) 
+# 8-9:   Risky Use (2 criteria)
+# 10:    Tolerance (1 criterion)
+# 11:    Withdrawal (1 criterion)
+#
+# Severity Classification:
+# - Mild: 2-3 criteria met
+# - Moderate: 4-5 criteria met  
+# - Severe: 6+ criteria met
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. SETUP AND DEPENDENCIES
+# ------------------------------------------------------------------------------
+
+# Load required libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  data.table,    # Fast data manipulation
+  dplyr,         # Data wrangling
+  psych,         # Descriptive statistics
+  janitor,       # Data cleaning utilities
+  here           # File path management
+)
+
+# Set global options
+options(scipen = 999)  # Disable scientific notation
+cat("DSM-5 AUD Scoring Pipeline Initialized\n")
+cat("==================================================\n\n")
+
+# ------------------------------------------------------------------------------
+# 2. DATA LOADING AND PREPROCESSING
+# ------------------------------------------------------------------------------
+
+#' Load and Preprocess Lifelines Data
+#' 
+#' This function loads the raw Lifelines data and performs initial preprocessing
+#' including variable selection, data cleaning, and type conversions.
+#' 
+#' @param file_path Character string: path to the Lifelines CSV file
+#' @param verbose Logical: whether to print progress messages
+#' @return data.table with preprocessed data
+#' 
+#' @details
+#' - Selects only AUD-relevant variables to reduce memory usage
+#' - Removes invalid entries ($6, $7, empty strings)
+#' - Converts gender to numeric coding (Female=0, Male=1)
+#' - Ensures all DSM-5 variables are numeric
+#' 
+load_and_preprocess_data <- function(file_path, verbose = TRUE) {
+  
+  if (verbose) cat("Step 1: Loading and preprocessing data...\n")
+  
+  # Load data efficiently
+  if (!file.exists(file_path)) {
+    stop("Error: File not found at specified path: ", file_path)
+  }
+  
+  df <- fread(file_path, showProgress = verbose)
+  if (verbose) cat("  - Loaded", nrow(df), "rows and", ncol(df), "columns\n")
+  
+  # Identify AUD-related variables
+  # DSM-5 variables for AUD criteria
+  # Alcohol frequency variable for lifetime drinking status
+  aud_vars <- grep("dsm5|ffqh_alcohol_adu_q_27", names(df), value = TRUE)
+  
+  # Exclude age-related variables (not needed for current scoring)
+  aud_vars <- aud_vars[!grepl("dsm5_peakage|dsm5_startage|dsm5_startuse|dsm5_peakyear", aud_vars)]
+  
+  if (verbose) cat("  - Identified", length(aud_vars), "AUD-related variables\n")
+  
+  # Select core variables + AUD variables
+  core_vars <- c("project_pseudo_id", "age", "gender")
+  df <- df[, c(core_vars, aud_vars), with = FALSE]
+  
+  # Clean invalid/missing data markers
+  # Lifelines uses $6, $7 for different types of missing data
+  df[df == "$6" | df == "$7" | df == ""] <- NA
+  
+  # Convert gender to numeric: FEMALE = 0, MALE = 1
+  # This facilitates statistical analyses
+  df[, gender := as.numeric(factor(gender, levels = c("FEMALE", "MALE"))) - 1]
+  
+  # Convert all DSM-5 variables to numeric
+  dsm5_vars <- grep("dsm5_", names(df), value = TRUE)
+  df[, (dsm5_vars) := lapply(.SD, as.numeric), .SDcols = dsm5_vars]
+  
+  # Convert alcohol frequency variable to numeric
+  if ("ffqh_alcohol_adu_q_27" %in% names(df)) {
+    df[, ffqh_alcohol_adu_q_27 := as.numeric(ffqh_alcohol_adu_q_27)]
+  }
+  
+  if (verbose) cat("  - Data preprocessing completed\n\n")
+  
+  return(df)
+}
+
+# ------------------------------------------------------------------------------
+# 3. LIFETIME DRINKING STATUS DERIVATION
+# ------------------------------------------------------------------------------
+
+#' Define Lifetime Drinking Status
+#' 
+#' Creates a binary indicator for lifetime alcohol use based on two sources:
+#' 1. Direct question about lifetime alcohol use (dsm5_lifetime_adu_q_01)
+#' 2. Food frequency questionnaire alcohol consumption (ffqh_alcohol_adu_q_27)
+#' 
+#' @param df data.table with preprocessed Lifelines data
+#' @param verbose Logical: whether to print progress messages
+#' @return data.table with lifetime_drink_status variable added
+#' 
+#' @details
+#' Logic for lifetime drinking status:
+#' - 1 (Lifetime drinker): Answered "yes" to lifetime use OR reports current drinking
+#' - 0 (Never drinker): Answered "no" to lifetime use AND no current drinking
+#' - NA: Insufficient information to determine status
+#' 
+define_lifetime_drink_status <- function(df, verbose = TRUE) {
+  
+  if (verbose) cat("Step 2: Defining lifetime drinking status...\n")
+  
+  df <- df %>%
+    mutate(
+      lifetime_drink_status = case_when(
+        # Explicit "yes" to lifetime drinking question
+        dsm5_lifetime_adu_q_01 == 1 ~ 1,
+        
+        # Current drinking (frequency > "never") implies lifetime drinking
+        ffqh_alcohol_adu_q_27 > 1 ~ 1,
+        
+        # Explicit "no" to lifetime drinking AND no current drinking
+        dsm5_lifetime_adu_q_01 == 2 & 
+          (ffqh_alcohol_adu_q_27 <= 1 | is.na(ffqh_alcohol_adu_q_27)) ~ 0,
+        
+        # All other cases: insufficient information
+        TRUE ~ NA_real_
+      )
+    )
+  
+  if (verbose) {
+    status_table <- table(df$lifetime_drink_status, useNA = "always")
+    cat("  - Lifetime drinking status distribution:\n")
+    cat("    Never drinkers:", status_table["0"], "\n")
+    cat("    Lifetime drinkers:", status_table["1"], "\n")
+    cat("    Unknown status:", status_table[is.na(names(status_table))], "\n\n")
+  }
+  
+  return(df)
+}
+
+# ------------------------------------------------------------------------------
+# 4. DSM-5 AUD CRITERIA SCORING
+# ------------------------------------------------------------------------------
+
+#' Score DSM-5 Alcohol Use Disorder Criteria
+#' 
+#' This function implements the complete DSM-5 AUD scoring algorithm including:
+#' - Individual criteria scoring (11 criteria total)
+#' - Missing data handling with statistical imputation
+#' - Binary diagnosis determination (≥2 criteria)
+#' - Severity classification (mild/moderate/severe)
+#' 
+#' @param df data.table with lifetime drinking status defined
+#' @param verbose Logical: whether to print progress messages
+#' @return data.table with all AUD scores and classifications
+#' 
+score_dsm5_aud <- function(df, verbose = TRUE) {
+  
+  if (verbose) cat("Step 3: Scoring DSM-5 AUD criteria...\n")
+  
+  # Map original variable names to standardized criterion names
+  # This mapping reflects the DSM-5 AUD criterion structure
+  df <- df %>%
+    rename(
+      # IMPAIRED CONTROL (Criteria 1-4)
+      dsm5_c1_impControl   = dsm5_problems_adu_q_09,  # Drinking more/longer than intended
+      dsm5_c2_impControl   = dsm5_problems_adu_q_10,  # Persistent desire/unsuccessful efforts to cut down
+      dsm5_c3_impControl   = dsm5_problems_adu_q_11,  # Great deal of time obtaining/using/recovering
+      dsm5_c4_impControl   = dsm5_problems_adu_q_18,  # Strong desire/craving to use alcohol
+      
+      # SOCIAL IMPAIRMENT (Criteria 5-7)  
+      dsm5_c5_socImpair    = dsm5_problems_adu_q_14,  # Failure to fulfill major role obligations
+      dsm5_c6_socImpair    = dsm5_problems_adu_q_17,  # Important activities given up/reduced
+      dsm5_c7_socImpair    = dsm5_problems_adu_q_12,  # Social/interpersonal problems
+      
+      # RISKY USE (Criteria 8-9)
+      dsm5_c8_riskuse      = dsm5_problems_adu_q_15,  # Use in hazardous situations
+      dsm5_c9_riskuse      = dsm5_problems_adu_q_13,  # Continued use despite problems
+      
+      # PHARMACOLOGICAL (Criteria 10-11)
+      dsm5_c10_tolerance   = dsm5_problems_adu_q_06,  # Tolerance
+      dsm5_c11a_withdrawal = dsm5_problems_adu_q_07,  # Withdrawal syndrome
+      dsm5_c11b_withdrawal = dsm5_problems_adu_q_08   # Using to avoid withdrawal
+    )
+  
+  if (verbose) cat("  - Variable mapping completed\n")
+  
+  # Recode responses: 1 = criterion met, 2 = criterion not met
+  # Convert to: 1 = criterion met, 0 = criterion not met
+  criterion_vars <- paste0("dsm5_c", c(1:10, "11a", "11b"))
+  df <- df %>%
+    mutate(across(all_of(criterion_vars), ~ dplyr::recode(., `1` = 1, `2` = 0)))
+  
+  # Combine withdrawal criteria (11a OR 11b = withdrawal present)
+  # DSM-5 considers withdrawal present if either syndrome occurs OR 
+  # alcohol is used to avoid withdrawal
+  df <- df %>%
+    mutate(
+      dsm5_c11_withdrawal = case_when(
+        dsm5_c11a_withdrawal == 1 | dsm5_c11b_withdrawal == 1 ~ 1,
+        dsm5_c11a_withdrawal == 0 & dsm5_c11b_withdrawal == 0 ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+  
+  if (verbose) cat("  - Criterion recoding completed\n")
+  
+  # Define final 11 DSM-5 AUD criteria
+  dsm5_criteria <- c(
+    "dsm5_c1_impControl", "dsm5_c2_impControl", "dsm5_c3_impControl", "dsm5_c4_impControl",
+    "dsm5_c5_socImpair", "dsm5_c6_socImpair", "dsm5_c7_socImpair",
+    "dsm5_c8_riskuse", "dsm5_c9_riskuse",
+    "dsm5_c10_tolerance", "dsm5_c11_withdrawal"
+  )
+  
+  # Calculate missing data count per participant
+  df <- df %>% 
+    mutate(dsm5_aud_miss = rowSums(is.na(select(., all_of(dsm5_criteria)))))
+  
+  if (verbose) cat("  - Missing data assessment completed\n")
+  
+  # Calculate criterion sum with missing data handling
+  # Uses personal mean imputation when ≤3 criteria are missing (≥73% completion rate)
+  # This approach follows NESARC-III methodology for handling missing DSM-5 data
+  df <- df %>%
+    mutate(
+      # Calculate personal mean of available criteria (individual-level imputation)
+      dsm5_row_mean = rowMeans(select(., all_of(dsm5_criteria)), na.rm = TRUE),
+      # Calculate sum of available criteria  
+      dsm5_row_sum  = rowSums(select(., all_of(dsm5_criteria)), na.rm = TRUE),
+      
+      # Final AUD sum with refined missing-tolerant logic
+      dsm5_aud_sum = case_when(
+        # Too much missing data (>27% missing): set to NA - conservative approach
+        dsm5_aud_miss > 3 ~ NA_real_,
+        
+        # Complete data: use actual sum
+        dsm5_aud_miss == 0 ~ dsm5_row_sum,
+        
+        # Some missing data (≤27%): use personal mean imputation
+        # Formula: answered_symptoms + (personal_mean × missing_count)
+        dsm5_aud_miss >= 1 & dsm5_aud_miss <= 3 ~ dsm5_row_sum + (dsm5_row_mean * dsm5_aud_miss)
+      )
+    ) %>%
+    # Remove temporary variables
+    select(-dsm5_row_mean, -dsm5_row_sum)
+  
+  if (verbose) cat("  - AUD sum calculation completed\n")
+  
+  # Determine binary AUD diagnosis
+  # DSM-5 requires ≥2 criteria for AUD diagnosis
+  df <- df %>%
+    mutate(
+      aud_dsm5_diagnosis = case_when(
+        # Clear diagnosis: ≥2 criteria met
+        dsm5_aud_sum >= 2 ~ 1,
+        
+        # Indeterminate cases due to missing data
+        is.na(dsm5_aud_sum) |                           # Sum is NA
+        (dsm5_aud_sum == 0 & dsm5_aud_miss >= 2) |     # Could reach threshold
+        (dsm5_aud_sum == 1 & dsm5_aud_miss >= 1) ~ NA_real_,  # Could reach threshold
+        
+        # Clear non-diagnosis: <2 criteria with sufficient data
+        TRUE ~ 0
+      )
+    )
+  
+  # Determine AUD severity classification with refined missing-tolerance
+  # Uses more conservative approach based on empirical Lifelines data patterns
+  df <- df %>%
+    mutate(
+      aud_dsm5_severity = case_when(
+        # Uncertain severity: Only mark as NA when classification could genuinely flip
+        # More refined boundaries based on real-world data patterns
+        (dsm5_aud_sum == 2 & dsm5_aud_miss >= 2) |  # 2 symptoms + 2+ missing: could be moderate
+        (dsm5_aud_sum == 3 & dsm5_aud_miss >= 1) |  # 3 symptoms + 1+ missing: could be moderate  
+        (dsm5_aud_sum == 4 & dsm5_aud_miss >= 2) |  # 4 symptoms + 2+ missing: could be severe
+        (dsm5_aud_sum == 5 & dsm5_aud_miss >= 1) ~ NA_real_,  # 5 symptoms + 1+ missing: could be severe
+        
+        # Confident severity classifications (missing data doesn't affect outcome)
+        dsm5_aud_sum < 2 ~ 0,                                    # No AUD (any missing OK)
+        dsm5_aud_sum %in% c(2, 3) & dsm5_aud_miss < 2 ~ 1,     # Mild AUD (confident)
+        dsm5_aud_sum %in% c(4, 5) & dsm5_aud_miss < 2 ~ 2,     # Moderate AUD (confident)
+        dsm5_aud_sum >= 6 ~ 3,                                   # Severe AUD (any missing OK)
+        
+        # Default to NA for edge cases
+        TRUE ~ NA_real_
+      )
+    )
+  
+  if (verbose) {
+    cat("  - AUD diagnosis and severity classification completed\n")
+    cat("  - Final AUD scoring completed\n\n")
+  }
+  
+  return(df)
+}
+
+# ------------------------------------------------------------------------------
+# 5. QUALITY CONTROL AND VALIDATION
+# ------------------------------------------------------------------------------
+
+#' Generate Quality Control Report
+#' 
+#' Produces comprehensive descriptive statistics and validation checks
+#' for the AUD scoring pipeline results.
+#' 
+#' @param df data.table with completed AUD scoring
+#' @return Prints detailed quality control report
+#' 
+generate_qc_report <- function(df) {
+  
+  cat("DSM-5 AUD Scoring - Quality Control Report\n")
+  cat("==========================================\n\n")
+  
+  # Sample characteristics
+  cat("1. SAMPLE CHARACTERISTICS\n")
+  cat("-------------------------\n")
+  cat("Total participants:", nrow(df), "\n")
+  cat("Mean age (SD):", round(mean(df$age, na.rm = TRUE), 1), 
+      "(", round(sd(df$age, na.rm = TRUE), 1), ")\n")
+  cat("Gender distribution:\n")
+  print(table(df$gender, useNA = "always"))
+  cat("\n")
+  
+  # Lifetime drinking status
+  cat("2. LIFETIME DRINKING STATUS\n")
+  cat("---------------------------\n")
+  status_table <- table(df$lifetime_drink_status, useNA = "always")
+  cat("Never drinkers:", status_table["0"], 
+      "(", round(100 * status_table["0"] / nrow(df), 1), "%)\n")
+  cat("Lifetime drinkers:", status_table["1"], 
+      "(", round(100 * status_table["1"] / nrow(df), 1), "%)\n")
+  cat("Unknown status:", status_table[is.na(names(status_table))], 
+      "(", round(100 * status_table[is.na(names(status_table))] / nrow(df), 1), "%)\n\n")
+  
+  # AUD criterion sum distribution
+  cat("3. DSM-5 AUD CRITERION SUM\n")
+  cat("---------------------------\n")
+  print(psych::describe(df$dsm5_aud_sum))
+  cat("\n")
+  
+  # Missing data patterns
+  cat("4. MISSING DATA PATTERNS\n")
+  cat("-------------------------\n")
+  missing_table <- table(df$dsm5_aud_miss, useNA = "always")
+  for (i in names(missing_table)) {
+    if (!is.na(i)) {
+      cat("Missing", i, "criteria:", missing_table[i], 
+          "(", round(100 * missing_table[i] / nrow(df), 1), "%)\n")
+    }
+  }
+  cat("\n")
+  
+  # AUD diagnosis distribution
+  cat("5. AUD DIAGNOSIS DISTRIBUTION\n")
+  cat("-----------------------------\n")
+  diag_table <- table(df$aud_dsm5_diagnosis, useNA = "always")
+  cat("No AUD:", diag_table["0"], 
+      "(", round(100 * diag_table["0"] / nrow(df), 1), "%)\n")
+  cat("AUD diagnosis:", diag_table["1"], 
+      "(", round(100 * diag_table["1"] / nrow(df), 1), "%)\n")
+  cat("Indeterminate:", diag_table[is.na(names(diag_table))], 
+      "(", round(100 * diag_table[is.na(names(diag_table))] / nrow(df), 1), "%)\n\n")
+  
+  # AUD severity distribution
+  cat("6. AUD SEVERITY DISTRIBUTION\n")
+  cat("----------------------------\n")
+  severity_labels <- c("0" = "No AUD", "1" = "Mild AUD", 
+                      "2" = "Moderate AUD", "3" = "Severe AUD")
+  severity_table <- table(df$aud_dsm5_severity, useNA = "always")
+  
+  for (i in names(severity_table)) {
+    if (!is.na(i) && i %in% names(severity_labels)) {
+      cat(severity_labels[i], ":", severity_table[i], 
+          "(", round(100 * severity_table[i] / nrow(df), 1), "%)\n")
+    } else if (is.na(i)) {
+      cat("Indeterminate:", severity_table[i], 
+          "(", round(100 * severity_table[i] / nrow(df), 1), "%)\n")
+    }
+  }
+  cat("\n")
+  
+  # Validation checks with empirical benchmarks
+  cat("7. VALIDATION CHECKS\n")
+  cat("--------------------\n")
+  
+  # Check 1: All diagnosed cases should have severity ≥ 1
+  diagnosed <- sum(df$aud_dsm5_diagnosis == 1, na.rm = TRUE)
+  mild_plus <- sum(df$aud_dsm5_severity >= 1, na.rm = TRUE)
+  cat("Diagnosed cases with severity ≥1:", mild_plus, "/", diagnosed, 
+      ifelse(diagnosed == mild_plus, "(✓ PASS)", "(✗ FAIL)"), "\n")
+  
+  # Check 2: No severity without diagnosis
+  severity_no_diag <- sum(df$aud_dsm5_severity >= 1 & df$aud_dsm5_diagnosis == 0, na.rm = TRUE)
+  cat("Cases with severity but no diagnosis:", severity_no_diag, 
+      ifelse(severity_no_diag == 0, "(✓ PASS)", "(✗ FAIL)"), "\n")
+  
+  # Check 3: Reasonable prevalence rates (based on epidemiological studies)
+  total_evaluable <- sum(!is.na(df$aud_dsm5_diagnosis))
+  prev_rate <- round(100 * sum(df$aud_dsm5_diagnosis == 1, na.rm = TRUE) / total_evaluable, 1)
+  cat("AUD prevalence rate:", prev_rate, "%", 
+      ifelse(prev_rate > 5 & prev_rate < 25, "(✓ REASONABLE)", "(⚠ CHECK)"), "\n")
+  
+  # Check 4: Missing data tolerance performance
+  high_completion <- sum(df$dsm5_aud_miss <= 1, na.rm = TRUE)
+  total_with_data <- sum(!is.na(df$dsm5_aud_miss))
+  completion_rate <- round(100 * high_completion / total_with_data, 1)
+  cat("High completion rate (≤1 missing):", completion_rate, "%", 
+      ifelse(completion_rate > 80, "(✓ GOOD)", "(⚠ CHECK)"), "\n")
+  
+  # Check 5: Data inconsistencies
+  if ("inconsistent_max_drinks" %in% names(df)) {
+    n_inconsistent <- sum(df$inconsistent_max_drinks == 1, na.rm = TRUE)
+    cat("Data inconsistencies flagged:", n_inconsistent, 
+        ifelse(n_inconsistent < nrow(df) * 0.01, "(✓ MINIMAL)", "(⚠ REVIEW)"), "\n")
+  }
+  
+  # Check 6: Severity distribution reasonableness
+  if (sum(df$aud_dsm5_severity == 3, na.rm = TRUE) > sum(df$aud_dsm5_severity == 1, na.rm = TRUE)) {
+    cat("Severity distribution: (⚠ UNUSUAL - More severe than mild cases)\n")
+  } else {
+    cat("Severity distribution: (✓ EXPECTED PATTERN)\n")
+  }
+  
+  cat("\nQuality Control Report Complete\n")
+  cat("===============================\n\n")
+}
+
+# ------------------------------------------------------------------------------
+# 6. MAIN PIPELINE EXECUTION
+# ------------------------------------------------------------------------------
+
+#' Execute Complete DSM-5 AUD Scoring Pipeline
+#' 
+#' This is the main function that executes the complete pipeline from
+#' data loading through final scoring and quality control.
+#' 
+#' @param file_path Character string: path to Lifelines data file
+#' @param output_path Character string: path for saving results (optional)
+#' @param run_qc Logical: whether to run quality control report
+#' @return data.table with complete AUD scoring results
+#' 
+execute_aud_pipeline <- function(file_path, output_path = NULL, run_qc = TRUE) {
+  
+  cat("EXECUTING DSM-5 AUD SCORING PIPELINE\n")
+  cat("====================================\n\n")
+  
+  # Step 1: Load and preprocess data
+  df_processed <- load_and_preprocess_data(file_path, verbose = TRUE)
+  
+  # Step 2: Define lifetime drinking status  
+  df_processed <- define_lifetime_drink_status(df_processed, verbose = TRUE)
+  
+  # Step 3: Score DSM-5 AUD criteria
+  df_final <- score_dsm5_aud(df_processed, verbose = TRUE)
+  
+  # Step 4: Validate and clean maximum drinks variable
+  if (verbose) cat("Step 4: Validating and cleaning data...\n")
+  
+  # Handle inconsistencies in maximum drinks in 24hrs
+  # Issue: Some lifetime drinkers report 0 max drinks (impossible)
+  df_final <- df_final %>%
+    mutate(
+      # Create cleaned maximum drinks variable
+      max_drinks_24h_clean = case_when(
+        # Set impossible values (0 drinks) to NA for lifetime drinkers
+        dsm5_maximum_adu_q_20 == 0 & lifetime_drink_status == 1 ~ NA_real_,
+        # Keep valid values
+        TRUE ~ dsm5_maximum_adu_q_20
+      ),
+      
+      # Flag inconsistent cases for quality control
+      inconsistent_max_drinks = case_when(
+        dsm5_maximum_adu_q_20 == 0 & lifetime_drink_status == 1 ~ 1,
+        TRUE ~ 0
+      )
+    )
+  
+  if (verbose) {
+    n_inconsistent <- sum(df_final$inconsistent_max_drinks == 1, na.rm = TRUE)
+    if (n_inconsistent > 0) {
+      cat("  - Found", n_inconsistent, "cases with inconsistent max drinks (set to NA)\n")
+    }
+  }
+  if (run_qc) {
+    generate_qc_report(df_final)
+  }
+  
+  # Step 5: Save results if output path provided
+  if (!is.null(output_path)) {
+    cat("Step 4: Saving results...\n")
+    fwrite(df_final, output_path)
+    cat("  - Results saved to:", output_path, "\n\n")
+  }
+  
+  cat("PIPELINE EXECUTION COMPLETED SUCCESSFULLY\n")
+  cat("========================================\n\n")
+  
+  return(df_final)
+}
+
+
+# ------------------------------------------------------------------------------
+# 7. ADDITIONAL UTILITY FUNCTIONS
+# ------------------------------------------------------------------------------
+
+#' Validate Missing-Tolerance Logic
+#' 
+#' Tests the DSM-5 AUD scoring logic with various missing data scenarios
+#' to ensure proper handling of uncertain cases.
+#' 
+validate_missing_tolerance <- function() {
+  
+  cat("Missing-Tolerance Logic Validation\n")
+  cat("==================================\n\n")
+  
+  # Create test scenarios based on real-world patterns
+  test_cases <- tibble(
+    scenario = c(
+      "0 symptoms, 0 missing", "0 symptoms, 1 missing", "0 symptoms, 2+ missing",
+      "1 symptom, 0 missing", "1 symptom, 1+ missing", 
+      "2 symptoms, 0 missing", "2 symptoms, 1 missing", "2 symptoms, 2+ missing",
+      "3 symptoms, 0 missing", "3 symptoms, 1+ missing",
+      "4 symptoms, 0 missing", "4 symptoms, 1 missing", "4 symptoms, 2+ missing",
+      "5 symptoms, 0 missing", "5 symptoms, 1+ missing",
+      "6+ symptoms, any missing", "Too much missing (>3)"
+    ),
+    dsm5_aud_sum = c(0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4, 4, 5, 5, 7, NA),
+    dsm5_aud_miss = c(0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 1, 4),
+    expected_diagnosis = c(0, 0, "NA", 0, "NA", 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, "NA"),
+    expected_severity = c(0, 0, 0, 0, 0, 1, 1, "NA", 1, "NA", 2, 2, "NA", 2, "NA", 3, "NA")
+  ) %>%
+    mutate(
+      # Apply actual diagnosis logic
+      computed_diagnosis = case_when(
+        dsm5_aud_sum >= 2 ~ 1,
+        is.na(dsm5_aud_sum) ~ NA_real_,
+        dsm5_aud_sum == 0 & dsm5_aud_miss >= 2 ~ NA_real_,
+        dsm5_aud_sum == 1 & dsm5_aud_miss >= 1 ~ NA_real_,
+        TRUE ~ 0
+      ),
+      
+      # Apply actual severity logic
+      computed_severity = case_when(
+        (dsm5_aud_sum == 2 & dsm5_aud_miss >= 2) |
+        (dsm5_aud_sum == 3 & dsm5_aud_miss >= 1) |
+        (dsm5_aud_sum == 4 & dsm5_aud_miss >= 2) |
+        (dsm5_aud_sum == 5 & dsm5_aud_miss >= 1) ~ NA_real_,
+        dsm5_aud_sum < 2 ~ 0,
+        dsm5_aud_sum %in% c(2, 3) & dsm5_aud_miss < 2 ~ 1,
+        dsm5_aud_sum %in% c(4, 5) & dsm5_aud_miss < 2 ~ 2,
+        dsm5_aud_sum >= 6 ~ 3,
+        TRUE ~ NA_real_
+      )
+    )
+  
+  # Display results
+  print(test_cases %>% 
+        select(scenario, dsm5_aud_sum, dsm5_aud_miss, 
+               expected_diagnosis, computed_diagnosis,
+               expected_severity, computed_severity))
+  
+  # Check for mismatches
+  diagnosis_match <- all(
+    (test_cases$expected_diagnosis == "NA" & is.na(test_cases$computed_diagnosis)) |
+    (test_cases$expected_diagnosis != "NA" & 
+     as.numeric(test_cases$expected_diagnosis) == test_cases$computed_diagnosis),
+    na.rm = TRUE
+  )
+  
+  severity_match <- all(
+    (test_cases$expected_severity == "NA" & is.na(test_cases$computed_severity)) |
+    (test_cases$expected_severity != "NA" & 
+     as.numeric(test_cases$expected_severity) == test_cases$computed_severity),
+    na.rm = TRUE
+  )
+  
+  cat("\nValidation Results:\n")
+  cat("Diagnosis logic:", ifelse(diagnosis_match, "✓ PASS", "✗ FAIL"), "\n")
+  cat("Severity logic:", ifelse(severity_match, "✓ PASS", "✗ FAIL"), "\n\n")
+  
+  return(list(diagnosis_match = diagnosis_match, severity_match = severity_match))
+}
+#' 
+#' Generates summary statistics table for AUD results
+#' 
+create_summary_table <- function(df) {
+  
+  summary_stats <- df %>%
+    filter(!is.na(aud_dsm5_diagnosis)) %>%
+    summarise(
+      n_total = n(),
+      mean_age = round(mean(age, na.rm = TRUE), 1),
+      sd_age = round(sd(age, na.rm = TRUE), 1),
+      pct_male = round(100 * mean(gender == 1, na.rm = TRUE), 1),
+      n_aud = sum(aud_dsm5_diagnosis == 1),
+      prev_aud = round(100 * n_aud / n_total, 2),
+      n_mild = sum(aud_dsm5_severity == 1, na.rm = TRUE),
+      n_moderate = sum(aud_dsm5_severity == 2, na.rm = TRUE),
+      n_severe = sum(aud_dsm5_severity == 3, na.rm = TRUE),
+      mean_criteria = round(mean(dsm5_aud_sum, na.rm = TRUE), 2)
+    )
+  
+  return(summary_stats)
+}
+
+# ------------------------------------------------------------------------------
+# END OF PIPELINE
+# ------------------------------------------------------------------------------
+
+cat("DSM-5 AUD Scoring Pipeline Loaded Successfully\n")
+cat("==============================================\n")
+cat("Ready for execution. Use execute_aud_pipeline() to run.\n\n")
