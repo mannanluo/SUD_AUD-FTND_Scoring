@@ -1,0 +1,520 @@
+# ===============================================================================
+# Fagerstrom Test for Nicotine Dependence (FTND) Scoring Pipeline - Lifelines
+# ===============================================================================
+# Author: Mannan Luo (m.luo@umcg.nl)
+# Date: 2025-09-04
+# 
+# This pipeline processes FTND data from Lifelines Wave 3, including:
+# 1. Data preprocessing and variable recoding
+# 2. Threshold identification for FTND completion
+# 3. Tobacco type assignment and cigarettes-per-day scoring
+# 4. Strict and lenient FTND sum score calculation with imputation
+# 5. Quality control and validation checks
+# ===============================================================================
+
+# Required Libraries
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(psych)
+
+# ===============================================================================
+# CONFIGURATION SECTION
+# ===============================================================================
+
+# Define FTND variable names used in Lifelines
+FTND_VARS <- list(
+  # Filtering and threshold variables
+  lifetime_smoking = "smoking_lifetime_adu_q_1",
+  tobacco_type_main = "ftnd_lifetime_adu_q_01",
+  threshold_vars = c("ftnd_lifetime_adu_q_01_a", "ftnd_lifetime_adu_q_01_b", 
+                     "ftnd_lifetime_adu_q_01_c", "ftnd_lifetime_adu_q_01_d", 
+                     "ftnd_lifetime_adu_q_01_e"),
+  
+  # Cigarettes per day by tobacco type
+  cpd_vars = c("ftnd_peak_adu_q_03_a", "ftnd_peak_adu_q_03_b", "ftnd_peak_adu_q_03_c",
+               "ftnd_peak_adu_q_03_d", "ftnd_peak_adu_q_03_e"),
+  
+  # Core FTND items (excluding CPD which varies by tobacco type)
+  core_items = c("ftnd_wakeup_adu_q_04", "ftnd_locations_adu_q_05", 
+                 "ftnd_moments_adu_q_06", "ftnd_mornings_adu_q_07", 
+                 "ftnd_illness_adu_q_08")
+)
+
+# FTND item weights (CPD=3, time to first=3, others=1 each)
+FTND_WEIGHTS <- c(3, 3, 1, 1, 1, 1)
+names(FTND_WEIGHTS) <- c("ftnd_peak", FTND_VARS$core_items)
+
+# Tobacco type mapping
+TOBACCO_TYPES <- c("cigarettes", "e_cigarettes", "cigars", "cigarillos", "pipes")
+
+# ===============================================================================
+# DATA LOADING AND PREPROCESSING FUNCTIONS
+# ===============================================================================
+
+#' Load and preprocess raw Lifelines data
+#' @param file_path Path to the input CSV file
+#' @return Preprocessed data.table with FTND variables
+load_and_preprocess_data <- function(file_path) {
+  cat("Loading data from:", file_path, "\n")
+  
+  # Load data
+  df <- fread(file_path)
+  cat("Original data dimensions:", nrow(df), "x", ncol(df), "\n")
+  
+  # Select FTND and smoking-related variables
+  ftnd_vars <- grep("ftnd|smoking_lifetime", names(df), value = TRUE)
+  ftnd_vars <- ftnd_vars[!grepl("ftnd_startage", ftnd_vars)]  # Exclude start age vars
+  
+  # Keep only relevant columns
+  df_smk <- df[, c("project_pseudo_id", "age", "gender", ftnd_vars), with = FALSE]
+  
+  # Replace Lifelines missing codes
+  df_smk[df_smk == "$7" | df_smk == ""] <- NA
+  
+  cat("Preprocessed data dimensions:", nrow(df_smk), "x", ncol(df_smk), "\n")
+  return(df_smk)
+}
+
+#' Convert FTND variables to numeric format
+#' @param df Data.table with FTND variables
+#' @return Data.table with numeric FTND variables
+convert_ftnd_to_numeric <- function(df) {
+  ftnd_vars <- grep("^ftnd_|smoking_lifetime", names(df), value = TRUE)
+  df[, (ftnd_vars) := lapply(.SD, as.numeric), .SDcols = ftnd_vars]
+  return(df)
+}
+
+#' Recode FTND variables from Lifelines format to standard FTND scoring
+#' @param df Data.table with numeric FTND variables
+#' @return Data.table with recoded FTND variables
+recode_ftnd_variables <- function(df) {
+  cat("Recoding FTND variables...\n")
+  
+  # Binary items (1=Yes, 2=No -> 1=Yes, 0=No)
+  binary_vars <- c(FTND_VARS$lifetime_smoking, FTND_VARS$threshold_vars,
+                   FTND_VARS$core_items[c(2:5)])  # locations, moments, mornings, illness
+  
+  for (var in binary_vars) {
+    if (var %in% names(df)) {
+      df[[var]] <- recode(df[[var]], `1` = 1, `2` = 0)
+    }
+  }
+  
+  # CPD variables (1-4 scale -> 0-3 scale)
+  for (var in FTND_VARS$cpd_vars) {
+    if (var %in% names(df)) {
+      df[[var]] <- recode(df[[var]], `1` = 0, `2` = 1, `3` = 2, `4` = 3)
+    }
+  }
+  
+  # Wake-up time (reverse coded: 1=within 5min, 4=after 60min -> 3,2,1,0)
+  wakeup_var <- FTND_VARS$core_items[1]
+  if (wakeup_var %in% names(df)) {
+    df[[wakeup_var]] <- recode(df[[wakeup_var]], `1` = 3, `2` = 2, `3` = 1, `4` = 0)
+  }
+  
+  cat("Recoding completed.\n")
+  return(df)
+}
+
+# ===============================================================================
+# THRESHOLD AND ELIGIBILITY FUNCTIONS
+# ===============================================================================
+
+#' Check data quality and identify inconsistencies in smoking status
+#' @param df Data.table with recoded FTND variables
+#' @return List with quality control metrics
+check_data_quality <- function(df) {
+  cat("Performing data quality checks...\n")
+  
+  # Basic counts
+  total_n <- nrow(df)
+  never_smokers <- sum(df[[FTND_VARS$lifetime_smoking]] == 0, na.rm = TRUE)
+  ever_smokers <- sum(df[[FTND_VARS$lifetime_smoking]] == 1, na.rm = TRUE)
+  
+  # Inconsistencies
+  ever_smokers_no_ftnd <- sum(df[[FTND_VARS$lifetime_smoking]] == 1 & 
+                              is.na(df[[FTND_VARS$tobacco_type_main]]), na.rm = TRUE)
+  never_smokers_with_ftnd <- sum(df[[FTND_VARS$lifetime_smoking]] == 0 & 
+                                 !is.na(df[[FTND_VARS$tobacco_type_main]]), na.rm = TRUE)
+  
+  qc_results <- list(
+    total_n = total_n,
+    never_smokers = never_smokers,
+    ever_smokers = ever_smokers,
+    ever_smokers_no_ftnd = ever_smokers_no_ftnd,
+    never_smokers_with_ftnd = never_smokers_with_ftnd
+  )
+  
+  # Print summary
+  cat("Quality Control Summary:\n")
+  cat(sprintf("  Total participants: %d\n", qc_results$total_n))
+  cat(sprintf("  Never smokers: %d (%.1f%%)\n", 
+              qc_results$never_smokers, 
+              100 * qc_results$never_smokers / qc_results$total_n))
+  cat(sprintf("  Ever smokers: %d (%.1f%%)\n", 
+              qc_results$ever_smokers, 
+              100 * qc_results$ever_smokers / qc_results$total_n))
+  cat(sprintf("  Inconsistencies:\n"))
+  cat(sprintf("    Ever smokers without FTND: %d\n", qc_results$ever_smokers_no_ftnd))
+  cat(sprintf("    Never smokers with FTND: %d\n", qc_results$never_smokers_with_ftnd))
+  
+  return(qc_results)
+}
+
+#' Identify participants who meet threshold for FTND completion
+#' @param df Data.table with recoded FTND variables
+#' @return Data.table with participants meeting threshold
+identify_threshold_participants <- function(df) {
+  cat("Identifying participants meeting FTND threshold...\n")
+  
+  # Participants who meet threshold (answered Yes to any threshold question)
+  df_threshold <- df[
+    get(FTND_VARS$threshold_vars[1]) == 1 |
+    get(FTND_VARS$threshold_vars[2]) == 1 |
+    get(FTND_VARS$threshold_vars[3]) == 1 |
+    get(FTND_VARS$threshold_vars[4]) == 1 |
+    get(FTND_VARS$threshold_vars[5]) == 1
+  ]
+  
+  cat(sprintf("Participants meeting threshold: %d\n", nrow(df_threshold)))
+  
+  # Participants who didn't meet threshold
+  df_no_threshold <- df[
+    get(FTND_VARS$threshold_vars[1]) == 0 |
+    get(FTND_VARS$threshold_vars[2]) == 0 |
+    get(FTND_VARS$threshold_vars[3]) == 0 |
+    get(FTND_VARS$threshold_vars[4]) == 0 |
+    get(FTND_VARS$threshold_vars[5]) == 0
+  ]
+  
+  cat(sprintf("Participants not meeting threshold: %d\n", nrow(df_no_threshold)))
+  
+  return(list(threshold = df_threshold, no_threshold = df_no_threshold))
+}
+
+# ===============================================================================
+# TOBACCO TYPE AND CPD ASSIGNMENT FUNCTIONS
+# ===============================================================================
+
+#' Assign primary tobacco type based on threshold questions
+#' @param df Data.table with threshold participants
+#' @return Data.table with tobacco_type variable added
+assign_tobacco_type <- function(df) {
+  cat("Assigning primary tobacco types...\n")
+  
+  df[, tobacco_type := fcase(
+    get(FTND_VARS$threshold_vars[1]) == 1, "cigarettes",
+    get(FTND_VARS$threshold_vars[2]) == 1, "e_cigarettes", 
+    get(FTND_VARS$threshold_vars[3]) == 1, "cigars",
+    get(FTND_VARS$threshold_vars[4]) == 1, "cigarillos",
+    get(FTND_VARS$threshold_vars[5]) == 1, "pipes"
+  )]
+  
+  # Print distribution
+  type_counts <- table(df$tobacco_type, useNA = "always")
+  cat("Tobacco type distribution:\n")
+  print(type_counts)
+  
+  return(df)
+}
+
+#' Assign CPD score based on tobacco type
+#' @param df Data.table with tobacco_type assigned
+#' @return Data.table with ftnd_peak variable added
+assign_cpd_score <- function(df) {
+  cat("Assigning cigarettes-per-day equivalent scores...\n")
+  
+  df[, ftnd_peak := fcase(
+    tobacco_type == "cigarettes", get(FTND_VARS$cpd_vars[1]),
+    tobacco_type == "e_cigarettes", get(FTND_VARS$cpd_vars[2]),
+    tobacco_type == "cigars", get(FTND_VARS$cpd_vars[3]),
+    tobacco_type == "cigarillos", get(FTND_VARS$cpd_vars[4]),
+    tobacco_type == "pipes", get(FTND_VARS$cpd_vars[5]),
+    default = NA_real_
+  )]
+  
+  # Check missing CPD by tobacco type
+  missing_cpd <- df[, .(missing_n = sum(is.na(ftnd_peak))), by = tobacco_type]
+  cat("Missing CPD scores by tobacco type:\n")
+  print(missing_cpd)
+  
+  return(df)
+}
+
+# ===============================================================================
+# FTND SCORING FUNCTIONS
+# ===============================================================================
+
+#' Calculate personal maximum score for imputation
+#' @param row Vector of FTND item responses
+#' @param weights Vector of FTND item weights
+#' @return Personal maximum possible score
+calc_personal_max <- function(row, weights) {
+  sum(weights[!is.na(row)])
+}
+
+#' Calculate FTND sum scores with strict and lenient approaches
+#' @param df_threshold Data.table with threshold participants
+#' @param df_no_threshold Data.table with non-threshold participants  
+#' @return Combined data.table with FTND scores
+calculate_ftnd_scores <- function(df_threshold, df_no_threshold) {
+  cat("Calculating FTND sum scores...\n")
+  
+  # Define all FTND items for scoring (CPD + core items)
+  all_ftnd_items <- c("ftnd_peak", FTND_VARS$core_items)
+  
+  # === Process threshold participants ===
+  # Count missing items
+  df_threshold[, n_missing_ftnd := rowSums(is.na(.SD)), .SDcols = all_ftnd_items]
+  
+  # Calculate observed sum and personal maximum
+  df_threshold[, ftnd_sum_observed := rowSums(.SD, na.rm = TRUE), .SDcols = all_ftnd_items]
+  df_threshold[, ftnd_personal_max := apply(.SD, 1, calc_personal_max, 
+                                            weights = FTND_WEIGHTS), 
+               .SDcols = all_ftnd_items]
+  
+  # Print missing pattern
+  missing_pattern <- table(df_threshold$n_missing_ftnd, useNA = "always")
+  cat("Missing item pattern in threshold participants:\n")
+  print(missing_pattern)
+  
+  # Strict Score (threshold participants only)
+  # - 0 missing: raw sum
+  # - 1-2 missing: weighted imputation
+  # - 3+ missing: NA
+  df_threshold[, ftnd_sum_strict := fifelse(
+    n_missing_ftnd == 0,
+    ftnd_sum_observed,
+    fifelse(n_missing_ftnd <= 2,
+            (ftnd_sum_observed / ftnd_personal_max) * 10,
+            NA_real_)
+  )]
+  
+  # Lenient Score (threshold participants)
+  # - Same as strict but 3+ missing = 0 instead of NA
+  df_threshold[, ftnd_sum_lenient := fifelse(
+    n_missing_ftnd == 0,
+    ftnd_sum_observed,
+    fifelse(n_missing_ftnd <= 2,
+            (ftnd_sum_observed / ftnd_personal_max) * 10,
+            0)
+  )]
+  
+  # === Process non-threshold participants ===
+  df_no_threshold[, ftnd_sum_strict := NA_real_]
+  df_no_threshold[, ftnd_sum_lenient := 0]
+  
+  # Combine datasets
+  df_combined <- rbind(df_threshold, df_no_threshold, fill = TRUE)
+  
+  # Print score summaries
+  cat("\nFTND Score Summaries:\n")
+  cat("Strict scores (threshold participants only):\n")
+  print(summary(df_combined$ftnd_sum_strict))
+  cat("Lenient scores (all participants):\n") 
+  print(summary(df_combined$ftnd_sum_lenient))
+  
+  return(df_combined)
+}
+
+# ===============================================================================
+# VALIDATION AND EXPORT FUNCTIONS
+# ===============================================================================
+
+#' Create diagnostic plots for FTND scores
+#' @param df Data.table with FTND scores
+#' @return List of ggplot objects
+create_diagnostic_plots <- function(df) {
+  plots <- list()
+  
+  # Strict score distribution
+  plots$strict <- ggplot(df[!is.na(ftnd_sum_strict)], aes(x = ftnd_sum_strict)) +
+    geom_histogram(binwidth = 1, fill = "steelblue", alpha = 0.7) +
+    labs(title = "Distribution of Strict FTND Scores",
+         subtitle = "Threshold participants only, imputed if ≤2 items missing",
+         x = "FTND Score", y = "Frequency") +
+    theme_minimal()
+  
+  # Lenient score distribution
+  plots$lenient <- ggplot(df, aes(x = ftnd_sum_lenient)) +
+    geom_histogram(binwidth = 1, fill = "coral", alpha = 0.7) +
+    labs(title = "Distribution of Lenient FTND Scores", 
+         subtitle = "All ever smokers, non-threshold and high missing = 0",
+         x = "FTND Score", y = "Frequency") +
+    theme_minimal()
+  
+  return(plots)
+}
+
+#' Validate FTND scoring calculations
+#' @param df Data.table with calculated FTND scores
+#' @return Validation results
+validate_ftnd_scoring <- function(df) {
+  cat("Validating FTND scoring calculations...\n")
+  
+  # Test cases for validation
+  threshold_participants <- df[!is.na(tobacco_type)]
+  
+  if (nrow(threshold_participants) > 0) {
+    # Check: participants with 0 missing should have strict = observed
+    no_missing <- threshold_participants[n_missing_ftnd == 0]
+    if (nrow(no_missing) > 0) {
+      validation_1 <- identical(no_missing$ftnd_sum_strict, no_missing$ftnd_sum_observed)
+      cat(sprintf("✓ No missing items: strict = observed? %s\n", validation_1))
+      
+      validation_2 <- identical(no_missing$ftnd_sum_strict, no_missing$ftnd_sum_lenient)
+      cat(sprintf("✓ No missing items: strict = lenient? %s\n", validation_2))
+    }
+    
+    # Check: participants with 3+ missing should have strict = NA, lenient = 0
+    high_missing <- threshold_participants[n_missing_ftnd >= 3]
+    if (nrow(high_missing) > 0) {
+      validation_3 <- all(is.na(high_missing$ftnd_sum_strict))
+      validation_4 <- all(high_missing$ftnd_sum_lenient == 0)
+      cat(sprintf("✓ High missing items: strict = NA? %s\n", validation_3))
+      cat(sprintf("✓ High missing items: lenient = 0? %s\n", validation_4))
+    }
+  }
+  
+  # Score ranges
+  strict_range <- range(df$ftnd_sum_strict, na.rm = TRUE)
+  lenient_range <- range(df$ftnd_sum_lenient, na.rm = TRUE)
+  
+  validation_5 <- strict_range[1] >= 0 && strict_range[2] <= 10
+  validation_6 <- lenient_range[1] >= 0 && lenient_range[2] <= 10
+  
+  cat(sprintf("✓ Strict scores in valid range [0,10]? %s (range: %.2f-%.2f)\n", 
+              validation_5, strict_range[1], strict_range[2]))
+  cat(sprintf("✓ Lenient scores in valid range [0,10]? %s (range: %.2f-%.2f)\n", 
+              validation_6, lenient_range[1], lenient_range[2]))
+  
+  cat("Validation completed.\n")
+}
+
+#' Export final FTND dataset
+#' @param df Data.table with FTND scores
+#' @param output_dir Output directory path
+#' @param file_prefix Prefix for output files
+export_ftnd_data <- function(df, output_dir, file_prefix = "ftnd_scored_lifelines") {
+  cat("Exporting FTND data...\n")
+  
+  # Create clean export dataset (remove intermediate calculation variables)
+  export_vars_to_remove <- c("n_missing_ftnd", "ftnd_sum_observed", "ftnd_personal_max")
+  df_export <- df[, !export_vars_to_remove, with = FALSE]
+  
+  # Create output directory if it doesn't exist
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # Generate filename with timestamp
+  timestamp <- format(Sys.Date(), "%Y%m%d")
+  filename_base <- paste0(file_prefix, "_", timestamp)
+  
+  # Export as RDS (preserves data types)
+  rds_file <- file.path(output_dir, paste0(filename_base, ".rds"))
+  saveRDS(df_export, rds_file)
+  cat(sprintf("Saved RDS file: %s\n", rds_file))
+  
+  # Export as CSV
+  csv_file <- file.path(output_dir, paste0(filename_base, ".csv"))
+  fwrite(df_export, csv_file)
+  cat(sprintf("Saved CSV file: %s\n", csv_file))
+  
+  return(df_export)
+}
+
+# ===============================================================================
+# MAIN PIPELINE FUNCTION
+# ===============================================================================
+
+#' Execute complete FTND scoring pipeline
+#' @param input_file Path to input CSV file
+#' @param output_dir Directory for output files
+#' @param create_plots Whether to create diagnostic plots
+#' @return Processed data.table with FTND scores
+run_ftnd_pipeline <- function(input_file, output_dir, create_plots = TRUE) {
+  cat("=== FTND SCORING PIPELINE STARTED ===\n")
+  cat("Timestamp:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+  
+  # Step 1: Load and preprocess data
+  cat("STEP 1: Loading and preprocessing data\n")
+  cat(rep("-", 50), "\n", sep = "")
+  df <- load_and_preprocess_data(input_file)
+  df <- convert_ftnd_to_numeric(df)
+  df <- recode_ftnd_variables(df)
+  
+  # Step 2: Quality control
+  cat("\nSTEP 2: Data quality assessment\n")
+  cat(rep("-", 50), "\n", sep = "")
+  qc_results <- check_data_quality(df)
+  
+  # Step 3: Identify threshold participants
+  cat("\nSTEP 3: Identifying threshold participants\n")
+  cat(rep("-", 50), "\n", sep = "")
+  threshold_data <- identify_threshold_participants(df)
+  df_threshold <- threshold_data$threshold
+  df_no_threshold <- threshold_data$no_threshold
+  
+  # Step 4: Assign tobacco types and CPD scores
+  cat("\nSTEP 4: Assigning tobacco types and CPD scores\n")
+  cat(rep("-", 50), "\n", sep = "")
+  df_threshold <- assign_tobacco_type(df_threshold)
+  df_threshold <- assign_cpd_score(df_threshold)
+  
+  # Step 5: Calculate FTND scores
+  cat("\nSTEP 5: Calculating FTND scores\n")
+  cat(rep("-", 50), "\n", sep = "")
+  df_final <- calculate_ftnd_scores(df_threshold, df_no_threshold)
+  
+  # Step 6: Validation
+  cat("\nSTEP 6: Validating calculations\n")
+  cat(rep("-", 50), "\n", sep = "")
+  validate_ftnd_scoring(df_final)
+  
+  # Step 7: Create diagnostic plots
+  if (create_plots) {
+    cat("\nSTEP 7: Creating diagnostic plots\n")
+    cat(rep("-", 50), "\n", sep = "")
+    plots <- create_diagnostic_plots(df_final)
+    
+    # Display plots
+    print(plots$strict)
+    print(plots$lenient)
+  }
+  
+  # Step 8: Export data
+  cat("\nSTEP 8: Exporting results\n")
+  cat(rep("-", 50), "\n", sep = "")
+  df_export <- export_ftnd_data(df_final, output_dir)
+  
+  cat("\n=== FTND SCORING PIPELINE COMPLETED ===\n")
+  cat("Final dataset dimensions:", nrow(df_export), "x", ncol(df_export), "\n")
+  
+  return(df_export)
+}
+
+# ===============================================================================
+# EXAMPLE USAGE
+# ===============================================================================
+
+# Example usage (uncomment and modify paths as needed):
+# 
+# # Set paths
+# input_file <- "/path/to/3a_q_2_results.csv"
+# output_dir <- "/path/to/output/"
+# 
+# # Run pipeline
+# ftnd_data <- run_ftnd_pipeline(
+#   input_file = input_file,
+#   output_dir = output_dir,
+#   create_plots = TRUE
+# )
+#
+# # Quick summary
+# cat("FTND Scoring Summary:\n")
+# cat("FTND scores available:", sum(!is.na(ftnd_data$ftnd_sum_score)), "participants\n")
+# print(summary(ftnd_data$ftnd_sum_score))
