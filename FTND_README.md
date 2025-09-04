@@ -183,4 +183,4 @@ Luo, M., Trindade Pons, V., Pingault, JB., Gillespie, N. A., & van Loo, H. M. Ge
 
 ### References:
 - Fagerström, K. (2012). Determinants of tobacco use and renaming the FTND to the Fagerström Test for Cigarette Dependence. *Nicotine & Tobacco Research*, 14(1), 75-78.
-- Lifelines Cohort Study: https://www.lifeline
+- Lifelines Cohort Study: [https://www.lifeline](https://www.lifelines-biobank.com/)
